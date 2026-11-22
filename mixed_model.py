@@ -42,90 +42,6 @@ def show_info():
 
 
 
-
-
-def generate_plate_dataset_cox(
-    n_samples: int = 5,
-    n_runs: int = 5,
-    n_obs: int = 15,
-    run_sd: float = 0.2,
-    shape: float = 1.0, # Weibull shape: 1 means constant hazard over time.
-    lambda_0: float = 0.02,
-    t_max: float = 100.0,
-    seed: int = 42,
-) -> pd.DataFrame:
-    """Simulate right-censored survival data for a Cox mixed-effects model.
-
-    Parameters
-    ----------
-    n_samples : int
-        Number of samples/treatments (max 26, named A-Z).
-    n_runs : int
-        Number of independent runs/plates.
-    n_obs : int
-        Number of observations per sample per run.
-    run_sd : float
-        Standard deviation of the Gaussian run random effect (log-HR scale).
-    shape : float
-        Weibull shape parameter (> 0).
-    lambda_0 : float
-        Baseline hazard scale parameter (> 0).
-    t_max : float
-        Right-censoring cutoff time.
-    seed : int
-        Random seed for reproducibility.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: sample, run, obs, event_time, obs_event.
-    """
-    
-    if n_samples > 26:
-        raise ValueError("too many samples for names A-Z")
-
-    rng = np.random.default_rng(seed) #self contained generator, faster, better stats
-
-    df = pd.DataFrame()
-    # log HR for samples, A is set to 0, the rest random  between log(0.5) and log(2)
-    sample_effects = np.zeros(n_samples)
-    sample_effects[1:] = rng.uniform(np.log(0.5), np.log(2.0), size=n_samples - 1)
-    
-
-    # loop over samples
-    for sample in range(n_samples):
-        sample_name = string.ascii_uppercase[sample] # make sample name A-Z
-        sample_effect = sample_effects[sample]  # log HR for this sample
-
-        # loop over runs for this sample
-        for run in range(n_runs):
-            run_effect = rng.normal(0.0, run_sd)
-            
-            # eta: total linear predictor (log-HR) for that specific (sample, run)
-            eta = sample_effect + run_effect 
-
-            #  scale is the characteristic survival time (1/lambda) of the Weibull distribution 
-            scale = (lambda_0 * np.exp(eta)) ** (-1.0 / shape)
-
-            # loop over observations for this run
-            for obs in range(n_obs):
-
-                #  rng.weibull(a=1.0) * scale is identical to rng.exponential(scale=scale)
-                raw_time = rng.weibull(a=shape) * scale
-                if raw_time <= t_max:
-                    event_time = raw_time
-                    obs_event = 1
-                else:
-                    event_time = t_max
-                    obs_event = 0
-
-                df_i = pd.DataFrame([{'sample': sample_name, 'run': f'{sample_name}_{run}', 'obs': obs, 'event_time': event_time, 'obs_event': obs_event}])
-                df = pd.concat([df, df_i], ignore_index=True)
-            
-
-    return df
-
-
 def plot_survival_by_sample(df: pd.DataFrame) -> None:
     """Plot Kaplan-Meier survival curves per sample, with one line/color per run.
 
@@ -162,10 +78,105 @@ def plot_survival_by_sample(df: pd.DataFrame) -> None:
     plt.show()
 
 
-df_sim = generate_plate_dataset_cox()
+def generate_plate_dataset_cox(
+    n_samples: int = 5,
+    n_runs: int = 5,
+    n_obs: int = 15,
+    run_sd: float = 0.2,
+    shape: float = 1.0,  # Weibull shape: 1 means constant hazard over time.
+    lambda_0: float = 0.02,
+    t_max: float = 100.0,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Simulate right-censored survival data for a Cox mixed-effects model.
+
+    Parameters
+    ----------
+    n_samples : int
+        Number of samples/treatments (1 to 26, named A-Z).
+    n_runs : int
+        Number of independent runs/plates per sample.
+    n_obs : int
+        Number of observations per sample per run.
+    run_sd : float
+        Standard deviation of the Gaussian run random effect (log-HR scale).
+    shape : float
+        Weibull shape parameter (> 0).
+    lambda_0 : float
+        Baseline hazard scale parameter (> 0).
+    t_max : float
+        Right-censoring cutoff time (> 0).
+    seed : int
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    df : pd.DataFrame
+        Columns: sample, run, obs, event_time, obs_event.
+    true_effects : dict[str, float]
+        Ground-truth log-hazard ratios keyed by sample name (e.g., {'A': 0.0, ...}).
+    """
+    if not (1 <= n_samples <= 26):
+        raise ValueError("n_samples must be between 1 and 26 (names A-Z)")
+    if n_runs < 1 or n_obs < 1:
+        raise ValueError("n_runs and n_obs must be at least 1")
+    if run_sd < 0:
+        raise ValueError("run_sd must be non-negative")
+    if shape <= 0 or lambda_0 <= 0 or t_max <= 0:
+        raise ValueError("shape, lambda_0, and t_max must be positive")
+
+    rng = np.random.default_rng(seed)  # self-contained generator, faster, better stats
+
+    df = pd.DataFrame()
+    # log HR for samples: A is reference (0.0), others random between log(0.5) and log(2.0)
+    sample_effects = np.zeros(n_samples)
+    sample_effects[1:] = rng.uniform(np.log(0.5), np.log(2.0), size=n_samples - 1)
+    true_effects = {}
+
+    # loop over samples
+    for sample in range(n_samples):
+        sample_name = string.ascii_uppercase[sample]  # make sample name A-Z
+        sample_effect = sample_effects[sample]  # log HR for this sample
+        true_effects[sample_name] = float(sample_effect)
+
+        # loop over runs for this sample
+        for run in range(n_runs):
+            run_effect = rng.normal(0.0, run_sd)
+
+            # eta: total linear predictor (log-HR) for that specific (sample, run)
+            eta = sample_effect + run_effect
+
+            # scale is the characteristic survival time (1/lambda) of the Weibull distribution
+            scale = (lambda_0 * np.exp(eta)) ** (-1.0 / shape)
+
+            # loop over observations for this run
+            for obs in range(n_obs):
+                # rng.weibull(a=1.0) * scale is identical to rng.exponential(scale=scale)
+                raw_time = rng.weibull(a=shape) * scale
+                if raw_time <= t_max:
+                    event_time = raw_time
+                    obs_event = 1
+                else:
+                    event_time = t_max
+                    obs_event = 0
+
+                df_i = pd.DataFrame([{
+                    'sample': sample_name,
+                    'run': f'{sample_name}_{run}',
+                    'obs': obs,
+                    'event_time': event_time,
+                    'obs_event': obs_event,
+                }])
+                df = pd.concat([df, df_i], ignore_index=True)
+
+    return df, true_effects
+
+#%%
+# C) RUN
+
+df_sim, true_eff = generate_plate_dataset_cox()
+
 plot_survival_by_sample(df_sim)
-
-
 
    
 # %%

@@ -1,12 +1,15 @@
-
 """
 Code for comparing right-censored survival data across samples or treatments when strong 
 run-to-run variability is expected.
 
 Experimental Structure
 Samples: n_samples
-Repeated runs: n_runs
+Repeated runs: n_runs (they contain only one sample type)
 Observations for each run: n_obs per run 
+
+
+First part:
+generation of simulated data
 
 
 env: UV
@@ -23,6 +26,7 @@ import string
 import getpass
 from datetime import datetime
 import matplotlib.pyplot as plt
+from statsmodels.duration.survfunc import SurvfuncRight
 from statsmodels.stats.multitest import multipletests
 import statsmodels.formula.api as smf
 
@@ -38,45 +42,15 @@ def show_info():
 
 
 
-def generate_plate_dataset (n_samples, n_runs, n_obs):
-    np.random.seed(42)
-
-    t_max = 100 # max observation time
-    range_surv_min = 10 # range for mean survival times
-    range_surv_max = 50
-
-    run_shift_max = 5 # run shift
-    obs_shift_max = 2 # observation variance
-
-
-    df = pd.DataFrame()
-    if n_samples > 26:
-        raise ValueError("too many samples for names A-Z")
-    else:
-        for sample in range(n_samples):
-            sample_name = string.ascii_uppercase[sample]
-            sample_mean = np.random.uniform(range_surv_min, range_surv_max)
-            for run in range(n_runs):
-                run_shift = np.random.uniform(-run_shift_max, run_shift_max)
-                for obs in range(n_obs):
-                    obs_shift = np.random.uniform(-obs_shift_max, obs_shift_max)
-                    event_time = sample_mean + run_shift + obs_shift
-                    if event_time <= t_max:
-                        obs_event = 1
-                    else:
-                        obs_event = 0
-                    df_i = pd.DataFrame({'sample': [sample_name], 'run': [run], 'obs': [obs], 'event_time': [event_time], 'obs_event': [obs_event]})
-                    df = pd.concat([df, df_i])
-    return df
 
 
 def generate_plate_dataset_cox(
     n_samples: int = 5,
     n_runs: int = 5,
     n_obs: int = 15,
-    run_sd: float = 0.8,
-    shape: float = 1.5,
-    lambda_0: float = 0.001,
+    run_sd: float = 0.2,
+    shape: float = 1.0, # Weibull shape: 1 means constant hazard over time.
+    lambda_0: float = 0.02,
     t_max: float = 100.0,
     seed: int = 42,
 ) -> pd.DataFrame:
@@ -106,37 +80,90 @@ def generate_plate_dataset_cox(
     pd.DataFrame
         Columns: sample, run, obs, event_time, obs_event.
     """
+    
     if n_samples > 26:
         raise ValueError("too many samples for names A-Z")
 
-    rng = np.random.default_rng(seed)
-    sample_effects = np.linspace(0.0, 1.0, n_samples)  # true log-HR vs sample A
-    rows = []
+    rng = np.random.default_rng(seed) #self contained generator, faster, better stats
 
-    for run in range(n_runs):
-        run_effect = rng.normal(0.0, run_sd)
-        for sample in range(n_samples):
-            sample_name = string.ascii_uppercase[sample]
+    df = pd.DataFrame()
+    # log HR for samples, A is set to 0, the rest random  between log(0.5) and log(2)
+    sample_effects = np.zeros(n_samples)
+    sample_effects[1:] = rng.uniform(np.log(0.5), np.log(2.0), size=n_samples - 1)
+    
+
+    # loop over samples
+    for sample in range(n_samples):
+        sample_name = string.ascii_uppercase[sample] # make sample name A-Z
+        sample_effect = sample_effects[sample]  # log HR for this sample
+
+        # loop over runs for this sample
+        for run in range(n_runs):
+            run_effect = rng.normal(0.0, run_sd)
             
-            eta = sample_effects[sample] + run_effect
+            # eta: total linear predictor (log-HR) for that specific (sample, run)
+            eta = sample_effect + run_effect 
+
+            #  scale is the characteristic survival time (1/lambda) of the Weibull distribution 
             scale = (lambda_0 * np.exp(eta)) ** (-1.0 / shape)
-            raw_times = rng.weibull(a=shape, size=n_obs) * scale
-            obs_times = np.minimum(raw_times, t_max)
-            obs_events = (raw_times <= t_max).astype(int)
 
-            for obs, (t, e) in enumerate(zip(obs_times, obs_events)):
-                rows.append({
-                    'sample': sample_name,
-                    'run': run,
-                    'obs': obs,
-                    'event_time': t,
-                    'obs_event': e,
-                })
+            # loop over observations for this run
+            for obs in range(n_obs):
 
-    return pd.DataFrame(rows)
+                #  rng.weibull(a=1.0) * scale is identical to rng.exponential(scale=scale)
+                raw_time = rng.weibull(a=shape) * scale
+                if raw_time <= t_max:
+                    event_time = raw_time
+                    obs_event = 1
+                else:
+                    event_time = t_max
+                    obs_event = 0
+
+                df_i = pd.DataFrame([{'sample': sample_name, 'run': f'{sample_name}_{run}', 'obs': obs, 'event_time': event_time, 'obs_event': obs_event}])
+                df = pd.concat([df, df_i], ignore_index=True)
+            
+
+    return df
 
 
-generate_plate_dataset (n_samples = 5, n_runs = 5, n_obs = 15)
+def plot_survival_by_sample(df: pd.DataFrame) -> None:
+    """Plot Kaplan-Meier survival curves per sample, with one line/color per run.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Survival dataset with columns: sample, run, event_time, obs_event.
+    """
+    samples = sorted(df['sample'].unique())
+    n_samples = len(samples)
+    max_time = df['event_time'].max()
+    # Okabe-Ito colorblind-friendly palette
+    palette = ['#0072B2', '#E69F00', '#009E73', '#CC79A7', '#D55E00', '#56B4E9', '#F0E442', '#000000']
+
+    fig, axes = plt.subplots(
+        1, n_samples, figsize=(3.8 * n_samples, 3.8), sharex=True, sharey=True, squeeze=False
+    )
+
+    for ax, sample in zip(axes.ravel(), samples):
+        df_s = df[df['sample'] == sample]
+        for idx, (run_id, df_r) in enumerate(df_s.groupby('run', sort=False)):
+            sf = SurvfuncRight(df_r['event_time'].to_numpy(), df_r['obs_event'].to_numpy())
+            times = np.concatenate([[0.0], sf.surv_times, [max_time]])
+            probs = np.concatenate([[1.0], sf.surv_prob, [sf.surv_prob[-1] if len(sf.surv_prob) else 1.0]])
+            ax.step(times, probs, where='post', color=palette[idx % len(palette)], label=str(run_id))
+
+        ax.set_title(f'Sample {sample}')
+        ax.set_xlabel('Time (a.u.)')
+        ax.set_ylim(-0.05, 1.05)
+        ax.legend(title='Run', fontsize=8, frameon=False)
+
+    axes[0, 0].set_ylabel('Survival probability')
+    fig.tight_layout()
+    plt.show()
+
+
+df_sim = generate_plate_dataset_cox()
+plot_survival_by_sample(df_sim)
 
 
 

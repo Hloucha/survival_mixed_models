@@ -26,6 +26,7 @@ import string
 import getpass
 from datetime import datetime
 import matplotlib.pyplot as plt
+from scipy import stats
 from statsmodels.duration.survfunc import SurvfuncRight
 from statsmodels.stats.multitest import multipletests
 import statsmodels.formula.api as smf
@@ -76,6 +77,62 @@ def plot_survival_by_sample(df: pd.DataFrame) -> None:
     axes[0, 0].set_ylabel('Survival probability')
     fig.tight_layout()
     plt.show()
+
+
+def median_estimate(df: pd.DataFrame, alpha: float = 0.05) -> pd.DataFrame:
+    """Estimate per-sample median survival time and t-based CI from run-level KM medians.
+
+    Computes a Kaplan-Meier median for each run, checks that all runs have a
+    defined median, and aggregates on the log scale using a t-interval across runs.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Survival dataset with columns: sample, run, event_time, obs_event.
+    alpha : float, optional
+        Significance level for the two-sided confidence interval (default 0.05).
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: sample, n_runs, median, ci_low, ci_high.
+    """
+    if not (0.0 < alpha < 1.0):
+        raise ValueError("alpha must be between 0 and 1")
+
+    run_rows = []
+    for (sample, run_id), df_r in df.groupby(['sample', 'run'], sort=False):
+        sf = SurvfuncRight(df_r['event_time'].to_numpy(), df_r['obs_event'].to_numpy())
+        run_rows.append({'sample': sample, 'run': run_id, 'median': float(sf.quantile(0.5))})
+
+    run_df = pd.DataFrame(run_rows)
+    missing = run_df[run_df['median'].isna() | (run_df['median'] <= 0)] # no median 
+    if not missing.empty:
+        missing_runs = [f"{r.sample}/{r.run}" for r in missing.itertuples(index=False)]
+        raise ValueError(
+            f"KM median undefined (censoring >= 50%) for runs: {', '.join(missing_runs)}"
+        )
+
+    results = []
+    for sample, grp in run_df.groupby('sample', sort=True):
+        n_runs = len(grp)
+        if n_runs < 2:
+            raise ValueError(f"Sample '{sample}' has only {n_runs} run(s); need >= 2 for t-CI")
+
+        log_medians = np.log(grp['median'].to_numpy())
+        mean_log = float(np.mean(log_medians))
+        se_log = float(np.std(log_medians, ddof=1) / np.sqrt(n_runs))
+        t_crit = float(stats.t.ppf(1.0 - alpha / 2.0, df=n_runs - 1))
+
+        results.append({
+            'sample': sample,
+            'n_runs': n_runs,
+            'median': float(np.exp(mean_log)),
+            'ci_low': float(np.exp(mean_log - t_crit * se_log)),
+            'ci_high': float(np.exp(mean_log + t_crit * se_log)),
+        })
+
+    return pd.DataFrame(results)
 
 
 def generate_plate_dataset_cox(
@@ -177,6 +234,7 @@ def generate_plate_dataset_cox(
 df_sim, true_eff = generate_plate_dataset_cox()
 
 plot_survival_by_sample(df_sim)
+print(median_estimate(df_sim))
 
    
 # %%
